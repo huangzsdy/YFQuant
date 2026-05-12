@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yfquant"
+version = "0.1.0"
+description = "A quantitative trading strategy system with custom backtester"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "YFQuant Contributors"}
+]
+dependencies = [
+    "yfinance>=0.2.0",
+    "akshare>=1.12.0",
+    "pandas>=1.4.0",
+    "numpy>=1.21.0",
+    "matplotlib>=3.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+    "black>=22.0.0",
+    "ruff>=0.1.0",
+]
+streamlit = [
+    "streamlit>=1.28.0",
+]
+
+[project.scripts]
+yfquant-download = "src.data.download_data:main"
+yfquant-backtest = "src.backtest.run_backtest:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.black]
+line-length = 100
+target-version = ["py38", "py39", "py310", "py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py38"
