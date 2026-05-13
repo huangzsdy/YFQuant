@@ -141,14 +141,27 @@ metrics = calculate_all_metrics(
 ### 3. Command Line Testing
 
 ```bash
-# Test data fetcher
-python -m src.data.fetcher
+# Test data fetcher (requires network)
+python -c "import sys; sys.path.insert(0, 'src'); from data.fetcher import DataFetcher; from pathlib import Path; fetcher = DataFetcher(cache_dir=Path('data')); print(fetcher.fetch('SPY', '2020-01-01', '2020-01-31'))"
 
 # Test backtest engine
-python -m src.backtest.engine
+python -c "import sys; sys.path.insert(0, 'src'); from backtest.engine import BacktestEngine; import pandas as pd; import numpy as np; dates = pd.date_range('2020-01-01', periods=100, freq='B'); prices = pd.DataFrame({'Date': dates, 'Close': 100 + np.cumsum(np.random.randn(100) * 2)}); prices['Close'] = prices['Close'].clip(lower=1); signals = pd.Series([1 if i % 20 < 10 else 0 for i in range(100)]); engine = BacktestEngine(initial_capital=10000); results = engine.run_backtest(prices, signals); print('Backtest engine test passed!')"
+
+# Test strategy modules
+python -c "import sys; sys.path.insert(0, 'src'); from strategies.dual_momentum import DualMomentumStrategy; from strategies.trend_following import TrendFollowingMA; from strategies.mean_reversion import MeanReversionRSI; print('All strategy modules imported successfully!')"
 
 # Test performance metrics
-python -m src.analytics.metrics
+python -c "import sys; sys.path.insert(0, 'src'); from analytics.metrics import calculate_all_metrics; import pandas as pd; import numpy as np; dates = pd.date_range('2020-01-01', periods=252, freq='B'); np.random.seed(42); portfolio_value = pd.Series(10000 * (1 + np.cumsum(np.random.randn(252) * 0.01)), index=dates); returns = portfolio_value.pct_change().fillna(0); trades = pd.Series(np.abs(np.random.randn(252) * 100), index=dates); metrics = calculate_all_metrics(portfolio_value, returns, trades); print('Performance metrics calculated successfully!')"
+```
+
+### 4. Run Unit Tests
+
+```bash
+# Run YFQuant's own unit tests (data fetcher)
+python -m pytest tests/test_fetcher.py -v --tb=short
+
+# Skip network-dependent integration tests
+python -m pytest tests/ -v -m "not integration"
 ```
 
 ---

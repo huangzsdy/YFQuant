@@ -79,88 +79,95 @@ class BacktestEngine:
         # 合并价格和信号
         df = prices.copy()
         df["Signal"] = signals
-        
+
         # 确保日期排序
         df = df.sort_values("Date").reset_index(drop=True)
-        
+
         # 计算每日收益率
         df["Daily_Return"] = df["Close"].pct_change()
-        
-        # 计算策略收益（使用 shift(1) 避免 look-ahead bias）
-        # signal[day] 在 day+1 生效
-        df["Strategy_Return"] = df["Signal"].shift(1) * df["Daily_Return"]
-        
+
+        # 使用前一天的信号避免 look-ahead bias
+        df["Prev_Signal"] = df["Signal"].shift(1).fillna(0)
+
+        # 计算策略收益（使用前一天信号）
+        df["Strategy_Return"] = df["Prev_Signal"] * df["Daily_Return"]
+
+        # 先计算持仓（需要初始资金）
+        df = self._calculate_position(df, self.initial_capital)
+
         # 计算交易成本
         df = self._calculate_transaction_costs(df)
-        
+
         # 计算组合价值
         df = self._calculate_portfolio_value(df)
-        
+
         # 计算回撤
         df = self._calculate_drawdown(df)
-        
+
         # 基准收益（买入持有）
         if benchmark_prices is not None:
             df["Benchmark_Return"] = benchmark_prices.pct_change()
             df["Benchmark_Cumulative"] = (1 + df["Benchmark_Return"]).cumprod() - 1
-        
+
         # 计算策略累计收益
         df["Strategy_Cumulative"] = (1 + df["Strategy_Return"]).fillna(0).cumprod() - 1
-        
+
         logger.info(f"回测完成: {len(df)} 个交易日")
-        
+
         return df
     
     def _calculate_transaction_costs(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         计算交易成本（佣金 + 滑点）。
-        
+
         Args:
             df: 包含价格和信号的DataFrame
-        
+
         Returns:
             包含交易成本的DataFrame
         """
         result_df = df.copy()
-        
+
         # 检测持仓变化
         result_df["Position_Changed"] = (
             result_df["Signal"] != result_df["Signal"].shift(1)
         ).fillna(False)
-        
+
         # 上一期的仓位
         result_df["Prev_Signal"] = result_df["Signal"].shift(1).fillna(0)
-        
+
         # 计算交易价值（使用当天收盘价）
-        # 当仓位变化时，需要买入或卖出
         result_df["Trade_Value"] = 0.0
-        
+
         # 当 signal 从 0 变为 1（买入）
         buy_mask = (result_df["Signal"] == 1) & (result_df["Prev_Signal"] == 0)
         result_df.loc[buy_mask, "Trade_Value"] = (
             result_df.loc[buy_mask, "Close"] * result_df.loc[buy_mask, "Shares"]
         )
-        
+
         # 当 signal 从 1 变为 0（卖出）
         sell_mask = (result_df["Signal"] == 0) & (result_df["Prev_Signal"] == 1)
         result_df.loc[sell_mask, "Trade_Value"] = (
             result_df.loc[sell_mask, "Close"] * result_df.loc[sell_mask, "Shares"]
         )
-        
-        # 计算佣金
-        result_df["Commission"] = result_df["Shares"] * self.commission_per_share
-        
+
+        # 佣金 = 交易股数 *每股佣金（只在买卖时收取）
+        result_df["Commission"] = 0.0
+        result_df.loc[buy_mask | sell_mask, "Commission"] = (
+            result_df.loc[buy_mask | sell_mask, "Shares"] * self.commission_per_share
+        )
+
         # 计算滑点（按交易价值的百分比）
         result_df["Slippage"] = result_df["Trade_Value"] * self.slippage_rate
-        
+
         # 总交易成本
         result_df["Transaction_Cost"] = result_df["Commission"] + result_df["Slippage"]
-        
+
         # 将交易成本反映到收益中
         result_df["Net_Return"] = result_df["Strategy_Return"] - (
             result_df["Transaction_Cost"] / (result_df["Close"] * result_df["Shares"]).replace(0, 1)
         )
-        
+
         return result_df
     
     def _calculate_position(
@@ -208,7 +215,8 @@ class BacktestEngine:
         initial_value = self.initial_capital
         
         # 计算累计收益
-        result_df["Portfolio_Value"] = initial_value * (1 + result_df["Net_Return"]).cumprod()
+        result_df["Cumulative_Return"] = (1 + result_df["Net_Return"]).fillna(1).cumprod()
+        result_df["Portfolio_Value"] = initial_value * result_df["Cumulative_Return"]
         
         # 第一天设置为初始资金
         result_df.loc[result_df.index[0], "Portfolio_Value"] = initial_value
