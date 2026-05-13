@@ -21,6 +21,25 @@ import numpy as np
 import matplotlib.pyplot as plt
 from datetime import datetime, date
 
+# 配置 matplotlib 中文字体（解决 Windows 上中文乱码问题）
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+
+# 尝试获取可用的中文字体
+try:
+    from matplotlib.font_manager import FontProperties
+    # 查找中文字体
+    for font_name in ['Microsoft YaHei', 'SimHei', 'Arial Unicode MS']:
+        try:
+            font = FontProperties(fname='C:/Windows/Fonts/' + font_name + '.ttf')
+            matplotlib.rcParams['font.family'] = font_name
+            break
+        except:
+            continue
+except:
+    pass
+
 # 导入项目模块
 from data.fetcher import DataFetcher
 from backtest.engine import BacktestEngine
@@ -288,7 +307,7 @@ if run_button:
                 st.markdown("---")
                 
                 # 权益曲线图
-                st.subheader("📈 权益曲线")
+                st.subheader("📈 策略 vs 买入持有 对比图")
                 
                 results_df = result["results"]
                 
@@ -300,29 +319,29 @@ if run_button:
                 else:
                     dates = results_df.index
                 
-                # 策略收益
-                ax.plot(
-                    dates,
-                    (1 + results_df["Strategy_Cumulative"].fillna(0)) * 100,
-                    label=f"{strategy_name} 策略",
-                    linewidth=2,
-                    color="blue",
-                )
-                
-                # 基准收益（买入持有）
+                # 基准收益（买入持有）- 先画，因为是参考线
                 ax.plot(
                     dates,
                     (1 + results_df["Benchmark_Cumulative"].fillna(0)) * 100,
-                    label="买入持有",
+                    label="Buy & Hold (Benchmark)",
                     linewidth=2,
                     color="gray",
                     linestyle="--",
                 )
                 
-                ax.set_title(f"{strategy_name} vs 买入持有", fontsize=14, fontweight="bold")
-                ax.set_xlabel("日期")
-                ax.set_ylabel("相对收益（初始=100）")
-                ax.legend(loc="upper left")
+                # 策略收益
+                ax.plot(
+                    dates,
+                    (1 + results_df["Strategy_Cumulative"].fillna(0)) * 100,
+                    label=f"{strategy_name} Strategy",
+                    linewidth=2,
+                    color="blue",
+                )
+                
+                ax.set_title(f"Portfolio Value Over Time: {strategy_name} vs Buy&Hold", fontsize=14, fontweight="bold")
+                ax.set_xlabel("Date")
+                ax.set_ylabel("Portfolio Value (Initial = 100)")
+                ax.legend(loc="upper left", fontsize=10)
                 ax.grid(True, alpha=0.3)
                 
                 # 格式化日期
@@ -333,23 +352,51 @@ if run_button:
                 st.markdown("---")
                 
                 # 回撤图
-                st.subheader("📉 回撤曲线")
+                st.subheader("📉 Drawdown Analysis")
                 
                 fig2, ax2 = plt.subplots(figsize=(12, 4))
                 
+                # 确保数据长度一致，清理异常值
+                drawdown_data = results_df["Drawdown"].fillna(0).clip(upper=0).abs() * 100
+                
+                # 数据验证：确保 dates 和 drawdown 长度一致
+                if len(dates) != len(drawdown_data):
+                    logger.warning(f"数据长度不一致: dates={len(dates)}, drawdown={len(drawdown_data)}")
+                    min_len = min(len(dates), len(drawdown_data))
+                    dates = dates[:min_len]
+                    drawdown_data = drawdown_data[:min_len]
+                
+                # 策略回撤
                 ax2.fill_between(
                     dates,
-                    -results_df["Drawdown"].fillna(0) * 100,
+                    drawdown_data,
                     0,
-                    alpha=0.3,
+                    alpha=0.4,
                     color="red",
-                    label="回撤",
+                    label=f"{strategy_name} Drawdown",
                 )
                 
-                ax2.set_title("组合回撤", fontsize=14, fontweight="bold")
-                ax2.set_xlabel("日期")
-                ax2.set_ylabel("回撤（%）")
+                # 标记最大回撤点
+                if len(drawdown_data) > 0:
+                    max_dd_idx = drawdown_data.idxmax() if hasattr(drawdown_data, 'idxmax') else drawdown_data.values.argmax()
+                    max_dd_date = dates[max_dd_idx] if hasattr(dates, '__getitem__') else dates.iloc[max_dd_idx]
+                    max_dd_value = drawdown_data.max()
+                    
+                    ax2.annotate(
+                        f"Max Drawdown: {max_dd_value:.2f}%",
+                        xy=(max_dd_date, max_dd_value),
+                        xytext=(max_dd_date, max_dd_value + 5),
+                        arrowprops=dict(arrowstyle="->", color="darkred"),
+                        fontsize=9,
+                        color="darkred",
+                    )
+                
+                ax2.set_title("Strategy Drawdown Over Time", fontsize=14, fontweight="bold")
+                ax2.set_xlabel("Date")
+                ax2.set_ylabel("Drawdown (%)")
+                ax2.legend(loc="lower left", fontsize=10)
                 ax2.grid(True, alpha=0.3)
+                ax2.set_ylim(bottom=0)  # 设置最小值为0
                 
                 fig2.autofmt_xdate()
                 
@@ -358,7 +405,7 @@ if run_button:
                 st.markdown("---")
                 
                 # 详细数据表格
-                st.subheader("📋 每日回测数据")
+                st.subheader("📋 Daily Backtest Data")
                 
                 display_df = results_df[[
                     "Date", "Close", "Signal", "Portfolio_Value",
@@ -367,25 +414,25 @@ if run_button:
                 ]].copy()
                 
                 display_df = display_df.rename(columns={
-                    "Date": "日期",
-                    "Close": "收盘价",
-                    "Signal": "信号",
-                    "Portfolio_Value": "组合价值",
-                    "Strategy_Return": "策略收益",
-                    "Strategy_Cumulative": "策略累计收益",
-                    "Benchmark_Cumulative": "基准累计收益",
-                    "Drawdown": "回撤",
+                    "Date": "Date",
+                    "Close": "Close",
+                    "Signal": "Signal",
+                    "Portfolio_Value": "Portfolio Value",
+                    "Strategy_Return": "Daily Return",
+                    "Strategy_Cumulative": "Strategy Return",
+                    "Benchmark_Cumulative": "Benchmark Return",
+                    "Drawdown": "Drawdown",
                 })
                 
                 # 格式化显示
                 st.dataframe(
                     display_df.style.format({
-                        "收盘价": "${:.2f}",
-                        "组合价值": "${:.2f}",
-                        "策略收益": "{:.4f}",
-                        "策略累计收益": "{:.4f}",
-                        "基准累计收益": "{:.4f}",
-                        "回撤": "{:.4f}",
+                        "Close": "${:.2f}",
+                        "Portfolio Value": "${:.2f}",
+                        "Daily Return": "{:.4f}",
+                        "Strategy Return": "{:.4f}",
+                        "Benchmark Return": "{:.4f}",
+                        "Drawdown": "{:.4f}",
                     }),
                     height=400,
                 )
@@ -397,35 +444,35 @@ if run_button:
 
 else:
     # 初始提示
-    st.info("👈 在左侧配置参数，然后点击 **运行回测** 开始回测")
+    st.info("👈 Configure parameters on the left sidebar, then click **Run Backtest** to start")
     
     # 显示项目简介
     st.markdown("""
-    ## 项目简介
+    ## Project Overview
     
-    **YFQuant** 是一套量化交易策略回测系统，支持：
+    **YFQuant** is a quantitative trading strategy backtesting system supporting:
     
-    ### 策略库
-    - **DualMomentum**: 双动量策略，基于相对和绝对动量进行月度调仓
-    - **TrendFollowingMA**: 趋势跟踪策略，基于200日均线进行每日/每周调仓
-    - **MeanReversionRSI**: 均值回归策略，基于RSI指标进行每月调仓
+    ### Strategy Library
+    - **DualMomentum**: Dual momentum strategy with monthly rebalancing based on relative and absolute momentum
+    - **TrendFollowingMA**: Trend following strategy with daily/weekly rebalancing based on 200-day MA
+    - **MeanReversionRSI**: Mean reversion strategy with monthly rebalancing based on RSI indicator
     
-    ### 绩效指标
-    - **CAGR**: 年化复合增长率
-    - **Sharpe Ratio**: 夏普比率（风险调整收益）
-    - **Sortino Ratio**: 索提诺比率（只考虑下行风险）
-    - **Max Drawdown**: 最大回撤
-    - **Calmar Ratio**: Calmar 比率（CAGR / Max Drawdown）
-    - **Turnover Rate**: 年化换手率（对小资金账户很重要）
+    ### Performance Metrics
+    - **CAGR**: Compound Annual Growth Rate
+    - **Sharpe Ratio**: Risk-adjusted return measure
+    - **Sortino Ratio**: Downside risk-adjusted return
+    - **Max Drawdown**: Maximum peak-to-trough decline
+    - **Calmar Ratio**: CAGR / Max Drawdown
+    - **Turnover Rate**: Annual portfolio turnover (important for small accounts)
     
-    ### 数据来源
-    - **Yahoo Finance**: 国际市场数据（美股、ETF等）
-    - **AkShare**: 国内市场数据备份源（A股、期货等）
+    ### Data Sources
+    - **Yahoo Finance**: International market data (US stocks, ETFs, etc.)
+    - **AkShare**: China market backup (A-shares, futures, etc.)
     
-    ### 回测引擎特性
-    - 向量化计算，无 look-ahead bias
-    - 交易成本模型：$0.005/股佣金 + 0.01%滑点
-    - 支持分数股和整数股
+    ### Backtest Engine Features
+    - Vectorized computation with no look-ahead bias
+    - Transaction cost model: $0.005/share commission + 0.01% slippage
+    - Support for fractional and integer shares
     """)
 
 

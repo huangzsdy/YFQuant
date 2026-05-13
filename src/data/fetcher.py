@@ -40,7 +40,26 @@ class DataFetcher:
     REQUIRED_COLUMNS: list = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
     
     # 请求间隔（秒），避免 rate limit
-    REQUEST_DELAY: float = 2.0
+    REQUEST_DELAY: float = 15.0
+
+    # TLS/网络错误重试次数（这类错误通常表示临时问题）
+    NETWORK_MAX_RETRIES: int = 3
+
+    # Rate limit 专用重试次数（更长等待）
+    RATE_LIMIT_MAX_RETRIES: int = 3
+
+    # Rate limit 初始等待时间（秒）
+    RATE_LIMIT_INITIAL_DELAY: float = 60.0
+
+    # 是否使用代理（某些地区需要）
+    
+    # 全局冷却机制
+    _last_request_time: float = 0.0
+    _rate_limit_cooldown: float = 0.0
+    
+    # 全局 rate limit 标志，一旦触发需要在冷却时间内跳过所有 yfinance 请求
+    _in_rate_limit_cooldown: bool = False
+    _rate_limit_recovery_time: float = 0.0
     
     def __init__(self, cache_dir: Optional[Path] = None) -> None:
         """
@@ -85,13 +104,28 @@ class DataFetcher:
         df.to_csv(cache_path, index=False)
         logger.info(f"数据已缓存: {cache_path}")
     
-    def _wait_before_request(self, attempt: int = 0) -> None:
+    def _wait_before_request(self, attempt: int = 0, is_rate_limit: bool = False) -> None:
         """请求前等待，指数退避"""
-        delay = self.REQUEST_DELAY * (2 ** attempt)
-        max_delay = 60
+        now = time.time()
+        
+        # 检查全局冷却时间
+        if now - self._last_request_time < self.REQUEST_DELAY:
+            wait_time = self.REQUEST_DELAY - (now - self._last_request_time)
+            logger.info(f"全局速率限制等待: {wait_time:.1f} 秒")
+            time.sleep(wait_time)
+        
+        if is_rate_limit:
+            # Rate limit 使用更长的等待时间
+            delay = self.RATE_LIMIT_INITIAL_DELAY * (2 ** attempt)
+            max_delay = 600  # 10分钟最大等待
+            self._rate_limit_cooldown = now + delay
+        else:
+            delay = self.REQUEST_DELAY * (2 ** attempt)
+            max_delay = 120
         delay = min(delay, max_delay)
         logger.info(f"等待 {delay:.1f} 秒后重试...")
         time.sleep(delay)
+        self._last_request_time = time.time()
     
     def _fetch_from_yfinance(
         self,
@@ -101,6 +135,8 @@ class DataFetcher:
         max_retries: int = 5,
     ) -> Optional[pd.DataFrame]:
         """从 yfinance 获取数据"""
+        import yfinance as yf
+        
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
@@ -108,19 +144,27 @@ class DataFetcher:
                 
                 logger.info(f"正在从 yfinance 下载 {ticker} (尝试 {attempt + 1}/{max_retries})...")
                 
-                import yfinance as yf
-                
-                # 使用 history 方法而不是 download（更稳定）
+                # 创建独立的 Ticker 对象而非复用
                 ticker_obj = yf.Ticker(ticker)
+                
+                # 使用 session 配置更好的连接参数
+                session = ticker_obj.session or yf.utils.get_json(
+                    f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}",
+                    {"range": "1d", "interval": "1d"}
+                )
+                
+                # history 方法会自动重试
                 df: pd.DataFrame = ticker_obj.history(
                     start=start_date,
                     end=end_date,
                     auto_adjust=False,
+                    raise_errors=True,  # 抛出异常而非返回空数据
                 )
                 
                 if df.empty:
                     logger.warning(f"yfinance 返回空数据: {ticker}")
                     if attempt < max_retries - 1:
+                        time.sleep(self.REQUEST_DELAY * (attempt + 1))  # 更长的等待
                         continue
                     return None
                 
@@ -152,13 +196,41 @@ class DataFetcher:
                 
             except Exception as e:
                 error_str = str(e)
-                if "Rate limited" in error_str or "429" in error_str:
+                
+                # 检测是否是网络/TLS错误，这类错误短暂，优先切换到其他源
+                network_errors = [
+                    "TLS connect error",
+                    "OpenSSL",
+                    "curl",
+                    "ConnectionError",
+                    "timeout",
+                    "SSLError",
+                    "HTTPSConnectionPool",
+                ]
+                
+                is_network_error = any(err in error_str for err in network_errors)
+                is_rate_limit = "Rate limited" in error_str or "429" in error_str or "Too Many Requests" in error_str or "rate" in error_str.lower()
+                
+                if is_network_error:
+                    logger.warning(f"yfinance 网络错误 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    if attempt >= self.NETWORK_MAX_RETRIES:
+                        # 网络问题多次失败，直接切换到其他源
+                        logger.warning(f"网络问题过多，停止重试 yfinance，切换到备用数据源")
+                        return None
+                    if attempt < max_retries - 1:
+                        self._wait_before_request(attempt, is_rate_limit=False)
+                elif is_rate_limit:
                     logger.warning(f"yfinance rate limit (尝试 {attempt + 1}/{max_retries})")
+                    # 一旦检测到 rate limit，立即设置全局冷却并切换到备用源
+                    # 不要在这里继续重试，直接返回 None 让调用方使用备用源
+                    self.__class__._in_rate_limit_cooldown = True
+                    self.__class__._rate_limit_recovery_time = time.time() + 300  # 5分钟冷却
+                    logger.warning(f"检测到 yfinance rate limit，进入 5 分钟全局冷却期")
+                    return None
                 else:
                     logger.warning(f"yfinance 下载失败 (尝试 {attempt + 1}/{max_retries}): {e}")
-                
-                if attempt < max_retries - 1:
-                    continue
+                    if attempt < max_retries - 1:
+                        self._wait_before_request(attempt, is_rate_limit=False)
         
         return None
     
@@ -168,28 +240,49 @@ class DataFetcher:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
     ) -> Optional[pd.DataFrame]:
-        """从 akshare 获取数据"""
+        """从 akshare 获取数据（A股和ETF）"""
         try:
             import akshare as ak
             
             logger.info(f"正在从 akshare 下载 {ticker}...")
             
+            # 清理日期格式
+            start_str = start_date.replace("-", "") if start_date else None
+            end_str = end_date.replace("-", "") if end_date else None
+            
             # A股
             if ticker.startswith(("60", "00", "30", "68")):
                 symbol = f"{ticker}.SH" if ticker.startswith(("60", "68")) else f"{ticker}.SZ"
-                df: pd.DataFrame = ak.stock_zh_a_hist(
-                    symbol=symbol,
-                    start_date=start_date.replace("-", "") if start_date else None,
-                    end_date=end_date.replace("-", "") if end_date else None,
-                    adjust="qfq",
-                )
+                try:
+                    df: pd.DataFrame = ak.stock_zh_a_hist(
+                        symbol=symbol,
+                        start_date=start_str,
+                        end_date=end_str,
+                        adjust="qfq",
+                    )
+                except Exception as e:
+                    logger.warning(f"akshare A股hist失败，尝试替代接口: {e}")
+                    # 尝试替代接口
+                    try:
+                        df = ak.stock_zh_a_daily(
+                            symbol=ticker,
+                            start_date=start_str,
+                            end_date=end_str,
+                            adjust="qfq",
+                        )
+                    except:
+                        df = None
             else:
                 # 尝试 ETF
                 try:
                     df = ak.fund_etf_hist_sina(symbol=ticker)
-                except Exception:
-                    logger.warning(f"akshare 暂不支持 {ticker}")
-                    return None
+                except Exception as e:
+                    logger.warning(f"akshare ETF接口失败: {e}")
+                    # 尝试东方财富网
+                    try:
+                        df = ak.fund_etf_hist_em(symbol=ticker)
+                    except:
+                        df = None
             
             if df is None or df.empty:
                 return None
@@ -204,10 +297,12 @@ class DataFetcher:
             if "Adj Close" not in df.columns:
                 df["Adj Close"] = df["Close"]
             
-            if pd.api.types.is_datetime64_any_dtype(df["日期"]):
-                df["Date"] = df["日期"].dt.strftime("%Y-%m-%d")
+            # 处理日期列
+            date_col = "日期" if "日期" in df.columns else "Date"
+            if pd.api.types.is_datetime64_any_dtype(df[date_col]):
+                df["Date"] = df[date_col].dt.strftime("%Y-%m-%d")
             else:
-                df["Date"] = pd.to_datetime(df["日期"]).dt.strftime("%Y-%m-%d")
+                df["Date"] = pd.to_datetime(df[date_col]).dt.strftime("%Y-%m-%d")
             
             df = df[["Date"] + self.REQUIRED_COLUMNS]
             
@@ -386,11 +481,23 @@ class DataFetcher:
                 return cached_df
         
         # 依次尝试各个数据源
-        sources = [
-            ("yfinance", self._fetch_from_yfinance),
-            ("akshare", self._fetch_from_akshare),
-            ("pandas_datareader", self._fetch_from_pandas_datareader),
-        ]
+        # 如果在全局冷却期，跳过 yfinance
+        if self.__class__._in_rate_limit_cooldown:
+            remaining = self.__class__._rate_limit_recovery_time - time.time()
+            if remaining > 0:
+                logger.warning(f"yfinance 处于全局冷却期，剩余 {remaining:.0f} 秒，跳过 yfinance")
+                sources = [
+                    ("akshare", self._fetch_from_akshare),
+                    ("pandas_datareader", self._fetch_from_pandas_datareader),
+                ]
+            else:
+                self.__class__._in_rate_limit_cooldown = False
+        else:
+            sources = [
+                ("yfinance", self._fetch_from_yfinance),
+                ("akshare", self._fetch_from_akshare),
+                ("pandas_datareader", self._fetch_from_pandas_datareader),
+            ]
         
         df = None
         for source_name, fetch_func in sources:
@@ -417,18 +524,69 @@ class DataFetcher:
         last_date: str,
         end_date: str,
     ) -> Optional[pd.DataFrame]:
-        """增量获取数据"""
+        """增量获取数据
+        
+        优先使用 yfinance，如果失败则尝试其他备用源。
+        检测到 rate limit 后进入全局冷却，直接使用备用源。
+        """
+        # 检查是否在 rate limit 冷却期内
+        if self.__class__._in_rate_limit_cooldown:
+            remaining = self.__class__._rate_limit_recovery_time - time.time()
+            if remaining > 0:
+                logger.warning(f"yfinance 处于全局冷却期，剩余 {remaining:.0f} 秒，直接使用备用源")
+                if not ticker.startswith(("60", "00", "30", "68")):
+                    return self._fetch_from_pandas_datareader(ticker, last_date, end_date)
+                else:
+                    return self._fetch_from_akshare(ticker, last_date, end_date)
+            else:
+                # 冷却期结束，重置标志
+                self.__class__._in_rate_limit_cooldown = False
+                logger.info("yfinance 全局冷却期结束，恢复正常使用")
+        
         last_dt = pd.to_datetime(last_date)
+        end_dt = pd.to_datetime(end_date)
+        days_old = (end_dt - last_dt).days
+        
         next_day = (last_dt + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
         
-        end_dt = pd.to_datetime(end_date)
-        if (end_dt - last_dt).days > 7:
+        if days_old > 7:
+            # 如果差距太大，只取最近7天
             next_day = (end_dt - pd.Timedelta(days=7)).strftime("%Y-%m-%d")
         
         logger.info(f"增量获取: {ticker} 从 {next_day} 到 {end_date}")
         
-        # 只尝试 yfinance（最常用）
+        # 首先尝试 yfinance
         df = self._fetch_from_yfinance(ticker, next_day, end_date)
+        
+        # 检查是否触发了全局冷却
+        if self.__class__._in_rate_limit_cooldown:
+            logger.warning("yfinance 触发了 rate limit，直接使用备用数据源")
+            if not ticker.startswith(("60", "00", "30", "68")):
+                return self._fetch_from_pandas_datareader(ticker, next_day, end_date)
+            else:
+                return self._fetch_from_akshare(ticker, next_day, end_date)
+        
+        # 如果 yfinance 失败，尝试其他备用源
+        if df is None or df.empty:
+            logger.warning(f"增量更新 yfinance 失败，尝试备用数据源...")
+            
+            # 等待后重试一次 yfinance（给冷却时间）
+            logger.info("等待 60 秒后重试 yfinance...")
+            time.sleep(60)
+            df = self._fetch_from_yfinance(ticker, next_day, end_date)
+            
+            if df is None or df.empty:
+                # 再次失败，切换备用源
+                logger.warning(f"重试 yfinance 仍然失败，尝试备用数据源...")
+                time.sleep(self.REQUEST_DELAY)
+                
+                # 尝试 akshare（对于 A 股或 ETF）
+                if not ticker.startswith(("60", "00", "30", "68")):
+                    # 非 A 股，尝试 pandas_datareader
+                    df = self._fetch_from_pandas_datareader(ticker, next_day, end_date)
+                else:
+                    # A 股使用 akshare
+                    df = self._fetch_from_akshare(ticker, next_day, end_date)
         
         if df is not None and not df.empty:
             df = df[df["Date"] > last_date]
@@ -446,8 +604,9 @@ class DataFetcher:
         
         for i, ticker in enumerate(tickers):
             if i > 0:
-                logger.info(f"等待 {self.REQUEST_DELAY} 秒后继续...")
-                time.sleep(self.REQUEST_DELAY)
+                wait_time = self.REQUEST_DELAY * 2
+                logger.info(f"等待 {wait_time} 秒后继续获取下一个 ticker...")
+                time.sleep(wait_time)
             
             df = self.fetch(ticker, start_date, end_date)
             if df is not None:
